@@ -16,9 +16,23 @@ limitations under the License.
 
 package images
 
-import "os"
+import (
+	"os"
+
+	"k8s.io/klog/v2"
+)
 
 func GetPauseImage() string {
+	pullSpec := getPauseImage()
+	klog.Infof("using pause image: %q", pullSpec)
+	return pullSpec
+}
+
+func getPauseImage() string {
+	if pullSpec, ok := os.LookupEnv("E2E_NROP_URL_PAUSE_IMAGE"); ok {
+		return pullSpec
+	}
+	// backward compatibility
 	if pullSpec, ok := os.LookupEnv("E2E_PAUSE_IMAGE_URL"); ok {
 		return pullSpec
 	}

@@ -14,23 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package wait
+package utils
 
 import (
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/klog/v2"
+	"context"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func deletionStatusFromError(kind string, key client.ObjectKey, err error) (bool, error) {
-	if err == nil {
-		klog.Infof("%s %#v still present", kind, key)
-		return false, nil
+func ListPodsByReplicaSet(aclient client.Client, rs appsv1.ReplicaSet) ([]corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	sel, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
+	if err != nil {
+		return nil, err
 	}
-	if apierrors.IsNotFound(err) {
-		klog.Infof("%s %#v is gone", kind, key)
-		return true, nil
+
+	err = aclient.List(context.TODO(), podList, &client.ListOptions{Namespace: rs.Namespace, LabelSelector: sel})
+	if err != nil {
+		return nil, err
 	}
-	klog.Warningf("failed to get the %s %#v: %v", kind, key, err)
-	return false, err
+
+	return podList.Items, nil
 }

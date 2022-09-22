@@ -1,18 +1,18 @@
 /*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Copyright 2022 Red Hat, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package config
 
@@ -38,10 +38,12 @@ import (
 	"github.com/openshift-kni/numaresources-operator/pkg/machineconfigpools"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectnames"
 
+	"github.com/openshift-kni/numaresources-operator/internal/wait"
+
 	numacellmanifests "github.com/openshift-kni/numaresources-operator/test/deviceplugin/pkg/numacell/manifests"
+
 	e2efixture "github.com/openshift-kni/numaresources-operator/test/utils/fixture"
 	"github.com/openshift-kni/numaresources-operator/test/utils/images"
-	e2ewait "github.com/openshift-kni/numaresources-operator/test/utils/objects/wait"
 )
 
 func SetupInfra(fxt *e2efixture.Fixture, nroOperObj *nropv1alpha1.NUMAResourcesOperator, nrtList nrtv1alpha1.NodeResourceTopologyList) {
@@ -58,7 +60,7 @@ func setupNUMACell(fxt *e2efixture.Fixture, nodeGroups []nropv1alpha1.NodeGroup,
 
 	Expect(nodeGroups).ToNot(BeEmpty(), "cannot autodetect the TAS node groups from the cluster")
 
-	mcps, err := machineconfigpools.GetNodeGroupsMCPs(context.TODO(), fxt.Client, nodeGroups)
+	mcps, err := machineconfigpools.GetListByNodeGroups(context.TODO(), fxt.Client, nodeGroups)
 	Expect(err).ToNot(HaveOccurred())
 
 	klog.Infof("setting e2e infra for %d MCPs", len(mcps))
@@ -85,7 +87,7 @@ func setupNUMACell(fxt *e2efixture.Fixture, nodeGroups []nropv1alpha1.NodeGroup,
 		dsName := objectnames.GetComponentName(numacellmanifests.Prefix, mcp.Name)
 		klog.Infof("setting e2e infra for %q: daemonset %q", mcp.Name, dsName)
 
-		pullSpec := getNUMACellDevicePluginPullSpec()
+		pullSpec := GetNUMACellDevicePluginPullSpec()
 		ds := numacellmanifests.DaemonSet(mcp.Spec.NodeSelector.MatchLabels, fxt.Namespace.Name, dsName, sa.Name, pullSpec)
 		err = fxt.Client.Create(context.TODO(), ds)
 		Expect(err).ToNot(HaveOccurred(), "cannot create the numacell daemonset %q in the namespace %q", ds.Name, ds.Namespace)
@@ -105,7 +107,7 @@ func setupNUMACell(fxt *e2efixture.Fixture, nodeGroups []nropv1alpha1.NodeGroup,
 			klog.Infof("waiting for daemonset %q to be ready", ds.Name)
 
 			// TODO: what if timeout < period?
-			ds, err := e2ewait.ForDaemonSetReady(fxt.Client, ds, 10*time.Second, timeout)
+			ds, err := wait.ForDaemonSetReady(fxt.Client, ds, 10*time.Second, timeout)
 			Expect(err).ToNot(HaveOccurred(), "DaemonSet %q failed to go running", ds.Name)
 		}(ds)
 	}
@@ -114,7 +116,17 @@ func setupNUMACell(fxt *e2efixture.Fixture, nodeGroups []nropv1alpha1.NodeGroup,
 	klog.Infof("e2e infra setup completed")
 }
 
+func GetNUMACellDevicePluginPullSpec() string {
+	pullSpec := getNUMACellDevicePluginPullSpec()
+	klog.Infof("using NUMACell image: %q", pullSpec)
+	return pullSpec
+}
+
 func getNUMACellDevicePluginPullSpec() string {
+	if pullSpec, ok := os.LookupEnv("E2E_NROP_URL_NUMACELL_DEVICE_PLUGIN"); ok {
+		return pullSpec
+	}
+	// backward compatibility
 	if pullSpec, ok := os.LookupEnv("E2E_NUMACELL_DEVICE_PLUGIN_URL"); ok {
 		return pullSpec
 	}

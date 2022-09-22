@@ -1,25 +1,29 @@
 /*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Copyright 2022 Red Hat, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package objects
 
 import (
+	"context"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func NewTestDaemonset(podLabels map[string]string, nodeSelector map[string]string, namespace, name, image string, command, args []string) *appsv1.DaemonSet {
@@ -64,4 +68,19 @@ func NewTestDaemonsetWithPodSpec(podLabels map[string]string, nodeSelector map[s
 		ds.Spec.Template.Spec.NodeSelector = nodeSelector
 	}
 	return ds
+}
+
+func GetDaemonSetsOwnedBy(cli client.Client, objMeta metav1.ObjectMeta) ([]*appsv1.DaemonSet, error) {
+	dsList := &appsv1.DaemonSetList{}
+	if err := cli.List(context.TODO(), dsList); err != nil {
+		return nil, err
+	}
+
+	var dss []*appsv1.DaemonSet
+	for i := range dsList.Items {
+		if IsOwnedBy(dsList.Items[i].ObjectMeta, objMeta) {
+			dss = append(dss, &dsList.Items[i])
+		}
+	}
+	return dss, nil
 }

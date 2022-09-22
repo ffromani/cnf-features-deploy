@@ -1,18 +1,18 @@
 /*
-Copyright 2022 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Copyright 2022 Red Hat, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package tests
 
@@ -30,12 +30,17 @@ import (
 	"k8s.io/klog/v2"
 
 	nrtv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
+
+	"github.com/openshift-kni/numaresources-operator/internal/nodes"
+	"github.com/openshift-kni/numaresources-operator/internal/resourcelist"
+	e2ereslist "github.com/openshift-kni/numaresources-operator/internal/resourcelist"
+	"github.com/openshift-kni/numaresources-operator/internal/wait"
+
 	schedutils "github.com/openshift-kni/numaresources-operator/test/e2e/sched/utils"
 	e2efixture "github.com/openshift-kni/numaresources-operator/test/utils/fixture"
 	e2enrt "github.com/openshift-kni/numaresources-operator/test/utils/noderesourcetopologies"
 	"github.com/openshift-kni/numaresources-operator/test/utils/nrosched"
 	"github.com/openshift-kni/numaresources-operator/test/utils/objects"
-	e2ewait "github.com/openshift-kni/numaresources-operator/test/utils/objects/wait"
 	e2epadder "github.com/openshift-kni/numaresources-operator/test/utils/padder"
 
 	serialconfig "github.com/openshift-kni/numaresources-operator/test/e2e/serial/config"
@@ -134,34 +139,44 @@ var _ = Describe("[serial][disruptive][scheduler] numaresources workload overhea
 			})
 			It("[test_id:47582][tier2] schedule a guaranteed Pod in a single NUMA zone and check overhead is not accounted in NRT", func() {
 
-				skipUnlessEnvVar("E2E_SERIAL_STAGING", "FIXME: NRT filter clashes with the noderesources fit plugin")
-
+				// even if it is not a hard rule, and even if there are a LOT of edge cases, a good starting point is usually
+				// in the ballpark of 5x the base load. We start like this
 				podResources := corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("6"),
+					corev1.ResourceMemory: resource.MustParse("6Gi"),
+				}
+
+				// to avoid issues with fractional resources being unaccounted atm, we round up to requests;
+				// for the test proper, as low as cpu=100m and mem=100Mi would have been sufficient.
+				minRes := corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("1"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				}
 
-				minRes := corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("100m"),
-					corev1.ResourceMemory: resource.MustParse("100Mi"),
-				}
-
 				// need a zone with resources for overhead, pod and a little bit more to avoid zone saturation
-				zoneRequiredResources := rtClass.Overhead.PodFixed.DeepCopy()
-				zoneRequiredResources.Cpu().Add(*podResources.Cpu())
-				zoneRequiredResources.Cpu().Add(*minRes.Cpu())
+				klog.Infof("kubernetes pod fixed overhead: %s", e2ereslist.ToString(rtClass.Overhead.PodFixed))
+				podFixedOverheadCPU, podFixedOverheadMem := resourcelist.RoundUpCoreResources(*rtClass.Overhead.PodFixed.Cpu(), *rtClass.Overhead.PodFixed.Memory())
+				podFixedOverhead := corev1.ResourceList{
+					corev1.ResourceCPU:    podFixedOverheadCPU,
+					corev1.ResourceMemory: podFixedOverheadMem,
+				}
+				klog.Infof("kubernetes pod fixed overhead rounded to: %s", e2ereslist.ToString(podFixedOverhead))
 
-				zoneRequiredResources.Memory().Add(*podResources.Memory())
-				zoneRequiredResources.Memory().Add(*minRes.Memory())
+				zoneRequiredResources := podResources.DeepCopy()
+				resourcelist.AddCoreResources(zoneRequiredResources, podFixedOverhead)
+				resourcelist.AddCoreResources(zoneRequiredResources, minRes)
+
+				resStr := e2ereslist.ToString(zoneRequiredResources)
+				klog.Infof("kubernetes final zone required resources: %s", resStr)
 
 				nrtCandidates := e2enrt.FilterAnyZoneMatchingResources(nrtTwoZoneCandidates, zoneRequiredResources)
-				const minCandidates int = 1
+				minCandidates := 1
 				if len(nrtCandidates) < minCandidates {
-					Skip(fmt.Sprintf("There should be at least %d nodes with at least %v resources: found %d", minCandidates, zoneRequiredResources, len(nrtCandidates)))
+					Skip(fmt.Sprintf("There should be at least %d nodes with at least %s resources: found %d", minCandidates, resStr, len(nrtCandidates)))
 				}
 
 				candidateNodeNames := e2enrt.AccumulateNames(nrtCandidates)
-				targetNodeName, ok := candidateNodeNames.PopAny()
+				targetNodeName, ok := e2efixture.PopNodeName(candidateNodeNames)
 				Expect(ok).To(BeTrue(), "cannot select a target node among %#v", candidateNodeNames.List())
 
 				By("padding non-target nodes")
@@ -171,8 +186,16 @@ var _ = Describe("[serial][disruptive][scheduler] numaresources workload overhea
 					nrtInfo, err := e2enrt.FindFromList(nrtCandidates, nodeName)
 					Expect(err).NotTo(HaveOccurred(), "missing NRT Info for node %q", nodeName)
 
-					for _, zone := range nrtInfo.Zones {
-						padPod, err := makePaddingPod(fxt.Namespace.Name, nodeName, zone, minRes)
+					baseload, err := nodes.GetLoad(fxt.K8sClient, nodeName)
+					Expect(err).NotTo(HaveOccurred(), "cannot get the base load for %q", nodeName)
+
+					for zIdx, zone := range nrtInfo.Zones {
+						zoneRes := minRes.DeepCopy() // to be extra safe
+						if zIdx == 0 {               // any zone is fine
+							baseload.Apply(zoneRes)
+						}
+
+						padPod, err := makePaddingPod(fxt.Namespace.Name, nodeName, zone, zoneRes)
 						Expect(err).NotTo(HaveOccurred())
 
 						pinnedPadPod, err := pinPodTo(padPod, nodeName, zone.Name)
@@ -186,11 +209,9 @@ var _ = Describe("[serial][disruptive][scheduler] numaresources workload overhea
 
 				}
 
-				failedPods := e2ewait.ForPodListAllRunning(fxt.Client, paddingPods)
-				for _, failedPod := range failedPods {
-					_ = objects.LogEventsForPod(fxt.K8sClient, failedPod.Namespace, failedPod.Name)
-				}
-				Expect(failedPods).To(BeEmpty())
+				By("Waiting for padding pods to be ready")
+				failedPodIds := e2efixture.WaitForPaddingPodsRunning(fxt, paddingPods)
+				Expect(failedPodIds).To(BeEmpty(), "some padding pods have failed to run")
 
 				By("checking the resource allocation as the test starts")
 				nrtListInitial, err := e2enrt.GetUpdated(fxt.Client, nrtList, 1*time.Minute)
@@ -213,9 +234,9 @@ var _ = Describe("[serial][disruptive][scheduler] numaresources workload overhea
 				Expect(err).NotTo(HaveOccurred(), "unable to create deployment %q", deployment.Name)
 
 				By("waiting for deployment to be up&running")
-				dpRunningTimeout := 1 * time.Minute
+				dpRunningTimeout := 2 * time.Minute
 				dpRunningPollInterval := 10 * time.Second
-				err = e2ewait.ForDeploymentComplete(fxt.Client, deployment, dpRunningPollInterval, dpRunningTimeout)
+				_, err = wait.ForDeploymentComplete(fxt.Client, deployment, dpRunningPollInterval, dpRunningTimeout)
 				Expect(err).NotTo(HaveOccurred(), "Deployment %q not up&running after %v", deployment.Name, dpRunningTimeout)
 
 				nrtListPostCreate, err := e2enrt.GetUpdated(fxt.Client, nrtListInitial, 1*time.Minute)
@@ -226,8 +247,7 @@ var _ = Describe("[serial][disruptive][scheduler] numaresources workload overhea
 				Expect(err).NotTo(HaveOccurred(), "Unable to get pods from Deployment %q:  %v", deployment.Name, err)
 
 				podResourcesWithOverhead := podResources.DeepCopy()
-				podResourcesWithOverhead.Cpu().Add(*rtClass.Overhead.PodFixed.Cpu())
-				podResourcesWithOverhead.Memory().Add(*rtClass.Overhead.PodFixed.Memory())
+				resourcelist.AddCoreResources(podResourcesWithOverhead, podFixedOverhead)
 
 				for _, pod := range pods {
 					Expect(pod.Spec.NodeName).To(Equal(targetNodeName))
@@ -241,12 +261,186 @@ var _ = Describe("[serial][disruptive][scheduler] numaresources workload overhea
 					nrtPostCreate, err := e2enrt.FindFromList(nrtListPostCreate.Items, pod.Spec.NodeName)
 					Expect(err).ToNot(HaveOccurred())
 
-					_, err = e2enrt.CheckZoneConsumedResourcesAtLeast(*nrtInitial, *nrtPostCreate, podResources)
+					match, err := e2enrt.CheckZoneConsumedResourcesAtLeast(*nrtInitial, *nrtPostCreate, podResources)
+					Expect(err).ToNot(HaveOccurred())
+					// If the pods are running, and they are because we reached this far, then the resources must have been accounted SOMEWHERE!
+					Expect(match).ToNot(Equal(""), "inconsistent accounting: no resources consumed by deployment running")
+
+					matchWithOverhead, err := e2enrt.CheckZoneConsumedResourcesAtLeast(*nrtInitial, *nrtPostCreate, podResourcesWithOverhead)
+					Expect(err).ToNot(HaveOccurred())
+					// OTOH if we add the overhead no zone is expected to have allocated the EXTRA resources - exactly because the overhead
+					// should not be taken into account!
+					Expect(matchWithOverhead).To(Equal(""), "unexpected found resource+overhead allocation accounted to zone %q", matchWithOverhead, match)
+				}
+
+			})
+
+			It("[test_id:53819][tier2] Pod pending when resources requested + pod overhead don't fit on the target node; NRT objects are not updated", func() {
+				var targetNodeName string
+				var targetNrtInitial *nrtv1alpha1.NodeResourceTopology
+				var targetNrtListInitial nrtv1alpha1.NodeResourceTopologyList
+				var err error
+
+				// even if it is not a hard rule, and even if there are a LOT of edge cases, a good starting point is usually
+				// in the ballpark of 5x the base load. We start like this
+				podResources := corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("6"),
+					corev1.ResourceMemory: resource.MustParse("6Gi"),
+				}
+
+				// to avoid issues with fractional resources being unaccounted atm, we round up to requests;
+				// for the test proper, as low as cpu=100m and mem=100Mi would have been sufficient.
+				minRes := corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				}
+
+				// need a zone with resources for overhead, pod and a little bit more to avoid zone saturation
+				klog.Infof("kubernetes pod fixed overhead: %s", e2ereslist.ToString(rtClass.Overhead.PodFixed))
+
+				candidateNodeNames := e2enrt.AccumulateNames(nrtTwoZoneCandidates)
+
+				var ok bool
+				targetNodeName, ok = e2efixture.PopNodeName(candidateNodeNames)
+				Expect(ok).To(BeTrue(), "cannot select a node among %#v", candidateNodeNames.List())
+				By(fmt.Sprintf("selecting node to schedule the test pod: %q", targetNodeName))
+
+				err = fxt.Client.List(context.TODO(), &targetNrtListInitial)
+				Expect(err).ToNot(HaveOccurred())
+				targetNrtInitial, err = e2enrt.FindFromList(targetNrtListInitial.Items, targetNodeName)
+				Expect(err).NotTo(HaveOccurred())
+
+				// finding the maximum allocatable resources across all zones and using it as the pod overhead
+				rtClass.Overhead = &nodev1.Overhead{
+					PodFixed: corev1.ResourceList{
+						corev1.ResourceCPU:    e2enrt.GetMaxAllocatableResourceNumaLevel(*targetNrtInitial, corev1.ResourceCPU),
+						corev1.ResourceMemory: e2enrt.GetMaxAllocatableResourceNumaLevel(*targetNrtInitial, corev1.ResourceMemory),
+					},
+				}
+
+				// updating the runtimeClass with the new podoverhead value
+				err = fxt.Client.Update(context.TODO(), rtClass)
+				Expect(err).NotTo(HaveOccurred())
+
+				podFixedOverheadCPU, podFixedOverheadMem := resourcelist.RoundUpCoreResources(*rtClass.Overhead.PodFixed.Cpu(), *rtClass.Overhead.PodFixed.Memory())
+				podFixedOverhead := corev1.ResourceList{
+					corev1.ResourceCPU:    podFixedOverheadCPU,
+					corev1.ResourceMemory: podFixedOverheadMem,
+				}
+				klog.Infof("kubernetes pod fixed overhead rounded to: %s", e2ereslist.ToString(podFixedOverhead))
+
+				zoneRequiredResources := podResources.DeepCopy()
+				resourcelist.AddCoreResources(zoneRequiredResources, podFixedOverhead)
+				resourcelist.AddCoreResources(zoneRequiredResources, minRes)
+
+				resStr := e2ereslist.ToString(zoneRequiredResources)
+				klog.Infof("kubernetes final zone required resources: %s", resStr)
+
+				By("padding non-target nodes")
+				var paddingPods []*corev1.Pod
+				for _, nodeName := range candidateNodeNames.List() {
+
+					nrtInfo, err := e2enrt.FindFromList(nrtTwoZoneCandidates, nodeName)
+					Expect(err).NotTo(HaveOccurred(), "missing NRT Info for node %q", nodeName)
+
+					baseload, err := nodes.GetLoad(fxt.K8sClient, nodeName)
+					Expect(err).NotTo(HaveOccurred(), "cannot get the base load for %q", nodeName)
+
+					for zIdx, zone := range nrtInfo.Zones {
+						zoneRes := minRes.DeepCopy() // to be extra safe
+						if zIdx == 0 {               // any zone is fine
+							baseload.Apply(zoneRes)
+						}
+
+						padPod, err := makePaddingPod(fxt.Namespace.Name, nodeName, zone, baseload.Resources)
+						Expect(err).NotTo(HaveOccurred())
+
+						pinnedPadPod, err := pinPodTo(padPod, nodeName, zone.Name)
+						Expect(err).NotTo(HaveOccurred())
+
+						err = fxt.Client.Create(context.TODO(), pinnedPadPod)
+						Expect(err).NotTo(HaveOccurred())
+
+						paddingPods = append(paddingPods, pinnedPadPod)
+					}
+
+				}
+
+				By("Waiting for padding pods on non-target node to be ready")
+				failedPodIds := e2efixture.WaitForPaddingPodsRunning(fxt, paddingPods)
+				Expect(failedPodIds).To(BeEmpty(), "some padding pods have failed to run")
+
+				By("padding a NUMA node on the target node")
+				var paddingPodsTargetNode []*corev1.Pod
+
+				baseload, err := nodes.GetLoad(fxt.K8sClient, targetNodeName)
+				Expect(err).NotTo(HaveOccurred(), "cannot get the base load for %q", targetNodeName)
+
+				for zIdx, zone := range targetNrtInitial.Zones {
+					zoneRes := minRes.DeepCopy() // to be extra safe
+					if zIdx == 0 {               // any zone is fine
+						baseload.Apply(zoneRes)
+
+						padPod, err := makePaddingPod(fxt.Namespace.Name, targetNodeName, zone, baseload.Resources)
+						Expect(err).NotTo(HaveOccurred())
+
+						pinnedPadPod, err := pinPodTo(padPod, targetNodeName, zone.Name)
+						Expect(err).NotTo(HaveOccurred())
+
+						err = fxt.Client.Create(context.TODO(), pinnedPadPod)
+						Expect(err).NotTo(HaveOccurred())
+
+						paddingPodsTargetNode = append(paddingPodsTargetNode, pinnedPadPod)
+					}
+				}
+
+				By("Waiting for padding pod on target node to be ready")
+				failedPodIds = e2efixture.WaitForPaddingPodsRunning(fxt, paddingPodsTargetNode)
+				Expect(failedPodIds).To(BeEmpty(), "some padding pods have failed to run")
+
+				By("checking the resource allocation as the test starts")
+				nrtListInitial, err := e2enrt.GetUpdated(fxt.Client, nrtList, 1*time.Minute)
+				Expect(err).ToNot(HaveOccurred())
+
+				By(fmt.Sprintf("Scheduling the testing deployment with RuntimeClass=%q", rtClass.Name))
+				var deploymentName string = "test-dp"
+				var replicas int32 = 1
+
+				podLabels := map[string]string{
+					"test": "test-dp",
+				}
+				nodeSelector := map[string]string{}
+				deployment := objects.NewTestDeployment(replicas, podLabels, nodeSelector, fxt.Namespace.Name, deploymentName, objects.PauseImage, []string{objects.PauseCommand}, []string{})
+				podSpec := &deployment.Spec.Template.Spec
+				podSpec.SchedulerName = serialconfig.Config.SchedulerName
+				podSpec.Containers[0].Resources.Limits = podResources
+				podSpec.RuntimeClassName = &rtClass.Name
+
+				err = fxt.Client.Create(context.TODO(), deployment)
+				Expect(err).NotTo(HaveOccurred(), "unable to create deployment %q", deployment.Name)
+
+				By("check the deployment pod is still pending")
+				pods, err := schedutils.ListPodsByDeployment(fxt.Client, *deployment)
+				Expect(err).NotTo(HaveOccurred(), "Unable to get pods from Deployment %q:  %v", deployment.Name, err)
+
+				for _, pod := range pods {
+					err = wait.WhileInPodPhase(fxt.Client, pod.Namespace, pod.Name, corev1.PodPending, 10*time.Second, 3)
+					if err != nil {
+						_ = objects.LogEventsForPod(fxt.K8sClient, pod.Namespace, pod.Name)
+					}
+					Expect(err).ToNot(HaveOccurred())
+				}
+
+				nrtListPostCreate, err := e2enrt.GetUpdated(fxt.Client, nrtListInitial, 1*time.Minute)
+				Expect(err).ToNot(HaveOccurred())
+
+				for _, initialNrt := range nrtListInitial.Items {
+					nrtPostDpCreate, err := e2enrt.FindFromList(nrtListPostCreate.Items, initialNrt.Name)
 					Expect(err).ToNot(HaveOccurred())
 
-					// Here error have to Ocurr because pod overhead resources should not be count
-					_, err = e2enrt.CheckZoneConsumedResourcesAtLeast(*nrtInitial, *nrtPostCreate, podResourcesWithOverhead)
-					Expect(err).To(HaveOccurred())
+					match, err := e2enrt.CheckEqualAvailableResources(initialNrt, *nrtPostDpCreate)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(match).To(BeTrue(), "inconsistent accounting: resources consumed by the updated pods on node %q", initialNrt.Name)
 				}
 
 			})
